@@ -1,0 +1,21 @@
+# 深度学习与张量计算
+torch>=2.0.0      # PyTorch 核心
+numpy>=1.21.0     # 科学计算基础
+scipy>=1.7.0      # 提供特殊函数(如勒让德高斯积分等)
+
+# GPU 加速库 (对应你代码里的 cupy)
+# 注意: 如果你的电脑是 CUDA 11.x, 请使用 cupy-cuda11x
+# 如果是 CUDA 12.x, 请使用 cupy-cuda12x
+cupy-cuda11x>=11.0.0 
+
+# 数据处理与机器学习 (对应原MATLAB中的随机森林/贝叶斯等先验算法)
+scikit-learn>=1.0.2
+pandas>=1.3.0
+
+# 可视化 (用于测试反演效果画图)
+matplotlib>=3.5.0
+
+# --- 以下为后续模块二(Web后端)预留的依赖 ---
+fastapi>=0.95.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
