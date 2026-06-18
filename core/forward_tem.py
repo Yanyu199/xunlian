@@ -1,7 +1,7 @@
 # tem_model_factory/core/forward_tem.py
 import numpy as np
 from numpy import pi, log
-import cupy as cp
+import numpy as cp
 
 
 # =============================================================================
@@ -795,6 +795,6 @@ class TEMForwardModeler:
         # 4. 提取 Z 分量并转移回 CPU
         # 索引 2 为 Z 分量
         dbzdt_gpu = Bt_df_gpu[:, :, 2]
-        dbzdt_cpu = cp.asnumpy(dbzdt_gpu)
+        dbzdt_cpu = np.array(dbzdt_gpu)
 
         return dbzdt_cpu

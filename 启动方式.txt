@@ -1,0 +1,5 @@
+刚刚进入项目的时候会出现base和venv两个环境，需要
+运行：
+1.conda deactivate
+之后正式启动项目
+2.python run_pipeline.py
