@@ -1,7 +1,79 @@
 # tem_model_factory/core/forward_tem.py
+import os
+import sys
+
 import numpy as np
 from numpy import pi, log
-import numpy as cp
+
+
+_FORWARD_BACKEND_ERROR = None
+_REQUESTED_BACKEND = os.environ.get("TEM_FORWARD_BACKEND", "auto").lower()
+
+
+def _add_cuda_dll_directories():
+    if os.name != "nt":
+        return
+    candidates = [
+        os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "torch", "lib"),
+        os.path.join(os.path.dirname(sys.executable), "Library", "bin"),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            try:
+                os.add_dll_directory(path)
+            except (AttributeError, OSError):
+                pass
+            os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+
+
+try:
+    if _REQUESTED_BACKEND in ("numpy", "cpu"):
+        raise ImportError("TEM_FORWARD_BACKEND requests NumPy/CPU")
+    _add_cuda_dll_directories()
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 1:
+        raise RuntimeError("CuPy is installed but no CUDA device is available")
+    cp.arange(1, dtype=cp.float32).sum().item()
+    _FORWARD_BACKEND = "cupy"
+except Exception as exc:
+    import numpy as cp
+
+    _FORWARD_BACKEND = "numpy"
+    _FORWARD_BACKEND_ERROR = str(exc)
+
+
+def _to_cpu_array(values):
+    if _FORWARD_BACKEND == "cupy":
+        return cp.asnumpy(values)
+    return np.asarray(values)
+
+
+def _any(values) -> bool:
+    if _FORWARD_BACKEND == "cupy":
+        return bool(cp.asnumpy(cp.any(values)))
+    return bool(cp.any(values))
+
+
+def forward_backend_status() -> dict:
+    info = {
+        "backend": _FORWARD_BACKEND,
+        "gpu_accelerated": _FORWARD_BACKEND == "cupy",
+        "requested_backend": _REQUESTED_BACKEND,
+        "fallback_reason": _FORWARD_BACKEND_ERROR,
+    }
+    if _FORWARD_BACKEND == "cupy":
+        device = cp.cuda.Device()
+        props = cp.cuda.runtime.getDeviceProperties(device.id)
+        name = props.get("name", b"")
+        if isinstance(name, bytes):
+            name = name.decode(errors="replace")
+        info.update({
+            "device_id": int(device.id),
+            "device_name": name,
+            "cupy_version": getattr(cp, "__version__", None),
+        })
+    return info
 
 
 # =============================================================================
@@ -553,7 +625,7 @@ class _TEMEngineGPU:
 
         for i in range(1, nLay):
             mask = i <= iTx_flat
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             sig_i, sig_im1 = 1.0 / rho[:, i], 1.0 / rho[:, i - 1]
             gmogp = (k2[:, i] - k2[:, i - 1]) / ((gama[:, i] + gama[:, i - 1]) ** 2)
             tmp1, tmp2 = gama[:, i] * sig_im1, gama[:, i - 1] * sig_i
@@ -564,7 +636,7 @@ class _TEMEngineGPU:
 
         for i in range(nLay - 2, -1, -1):
             mask = i >= (iTx_flat - 1)
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             sig_i, sig_ip1 = 1.0 / rho[:, i], 1.0 / rho[:, i + 1]
             gmogp = (k2[:, i] - k2[:, i + 1]) / ((gama[:, i] + gama[:, i + 1]) ** 2)
             tmp1, tmp2 = gama[:, i] * sig_ip1, gama[:, i + 1] * sig_i
@@ -596,7 +668,7 @@ class _TEMEngineGPU:
         curr_srcm_ay, curr_srcm_lz = srcm_ay, srcm_lz
         for i in range(nLay - 2, -1, -1):
             mask = i < iTx
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             is_below_src = (i == (iTx - 1))
             src_ay_term = cp.where(is_below_src, curr_srcm_ay, 0.0)
             src_lz_term = cp.where(is_below_src, curr_srcm_lz, 0.0)
@@ -614,7 +686,7 @@ class _TEMEngineGPU:
         curr_srcp_ay, curr_srcp_lz = srcp_ay, srcp_lz
         for i in range(1, nLay):
             mask = i > iTx
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             is_above_src = (i == (iTx + 1))
             src_ay_term = cp.where(is_above_src, curr_srcp_ay, 0.0)
             src_lz_term = cp.where(is_above_src, curr_srcp_lz, 0.0)
@@ -661,7 +733,7 @@ class _TEMEngineGPU:
 
         for i in range(1, nLay):
             mask = i <= iTx_flat
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             sig_i, sig_im1 = 1.0 / rho[:, i], 1.0 / rho[:, i - 1]
             sgmosgp = (gama[:, i] * sig_im1 - gama[:, i - 1] * sig_i) / (gama[:, i] * sig_im1 + gama[:, i - 1] * sig_i)
             t1 = Sm[:, i - 1] * expmgh2[:, i - 1]
@@ -669,7 +741,7 @@ class _TEMEngineGPU:
 
         for i in range(nLay - 2, -1, -1):
             mask = i >= (iTx_flat - 1)
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             sig_i, sig_ip1 = 1.0 / rho[:, i], 1.0 / rho[:, i + 1]
             sgmosgp = (gama[:, i] * sig_ip1 - gama[:, i + 1] * sig_i) / (gama[:, i] * sig_ip1 + gama[:, i + 1] * sig_i)
             t1 = Sp[:, i + 1] * expmgh2[:, i + 1]
@@ -688,7 +760,7 @@ class _TEMEngineGPU:
 
         for i in range(nLay - 2, -1, -1):
             mask = i < iTx
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             src_term = cp.where(i == (iTx - 1), srcm, 0.0)
             c_val = (c_coef[:, i + 1] * expmgh[:, i + 1] + d_coef[:, i + 1] + src_term) / (
                         1.0 + Sm[:, i] * expmgh[:, i])
@@ -697,7 +769,7 @@ class _TEMEngineGPU:
 
         for i in range(1, nLay):
             mask = i > iTx
-            if not cp.any(mask): continue
+            if not _any(mask): continue
             src_term = cp.where(i == (iTx + 1), srcp, 0.0)
             d_val = (c_coef[:, i - 1] + d_coef[:, i - 1] * expmgh[:, i - 1] + src_term) / (
                         1.0 + Sp[:, i] * expmgh[:, i])
@@ -795,6 +867,6 @@ class TEMForwardModeler:
         # 4. 提取 Z 分量并转移回 CPU
         # 索引 2 为 Z 分量
         dbzdt_gpu = Bt_df_gpu[:, :, 2]
-        dbzdt_cpu = np.array(dbzdt_gpu)
+        dbzdt_cpu = _to_cpu_array(dbzdt_gpu)
 
         return dbzdt_cpu

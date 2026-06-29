@@ -1,147 +1,154 @@
-# tem_model_factory/03_train.py
-import torch
-import torch.nn as nn
-import numpy as np
 import json
 import os
-from torch.utils.data import DataLoader, TensorDataset
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
 from config import *
 from core.net import TEM_Seq2Seq_Net
 
 
-# ==========================================
-# 修复 3: 定制的相对百分比误差损失函数 (MAPE变体)
-# ==========================================
 class TEMRelativeLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
     def forward(self, outputs, targets):
-        """
-        考虑到序列输出是交替的: [res1, thick1, res2, thick2, ..., res_n]
-        我们统一计算相对百分比误差
-        """
         eps = 1e-8
-        # 计算绝对相对误差: |目标 - 预测| / 目标
-        # 使用 torch.mean(..., dim=1) 对每一个样本求所有参数的平均相对误差
-        rel_error = torch.mean(torch.abs(targets - outputs) / (targets + eps), dim=1)
-
-        # 在整个 Batch 上求平均
-        return torch.mean(rel_error)
+        return torch.mean(torch.mean(torch.abs(targets - outputs) / (torch.abs(targets) + eps), dim=1))
 
 
-# ==========================================
-# 修复 5: 学习率调度策略 (对齐原作者的阶梯衰减)
-# ==========================================
 def lambda_lr(epoch):
     if epoch <= 70:
         return 1.0
-    elif epoch <= 150:
+    if epoch <= 150:
         return 0.5
-    elif epoch <= 180:
+    if epoch <= 180:
         return 0.3
-    elif epoch <= 200:
+    if epoch <= 200:
         return 0.1
-    else:
-        return 0.05
+    return 0.05
+
+
+def interleave_targets(y_raw):
+    y_interleaved = np.zeros_like(y_raw)
+    for i in range(LAYER_NUM - 1):
+        y_interleaved[:, i * 2] = y_raw[:, i]
+        y_interleaved[:, i * 2 + 1] = y_raw[:, LAYER_NUM + i]
+    y_interleaved[:, -1] = y_raw[:, LAYER_NUM - 1]
+    return y_interleaved
 
 
 def train_pipeline():
-    print("=== 开始运行 03: 深度学习 Seq2Seq 反演训练 ===")
+    print("=== Step 03: Seq2Seq inversion training ===")
+    x_path = os.path.join(DATA_DIR, "X_train.npy")
+    y_path = os.path.join(DATA_DIR, "Y_train.npy")
+    if not os.path.exists(x_path) or not os.path.exists(y_path):
+        raise FileNotFoundError("未找到 X_train.npy 或 Y_train.npy，请先运行 02_data_generator.py")
 
-    # 1. 加载数据
-    X_raw = np.load(os.path.join(DATA_DIR, "X_train.npy"))
-    Y_raw = np.load(os.path.join(DATA_DIR, "Y_train.npy"))
+    x_raw = np.load(x_path)
+    y_raw = np.load(y_path)
+    if len(x_raw) < 2:
+        raise ValueError("训练样本数量至少需要 2 条。")
+    time_path = os.path.join(DATA_DIR, "time_gates.npy")
+    if os.path.exists(time_path):
+        target_times = np.load(time_path)
+    else:
+        target_times = np.logspace(np.log10(TIME_MIN), np.log10(TIME_MAX), x_raw.shape[1])
 
-    batch_count = X_raw.shape[0]
+    y_interleaved = interleave_targets(y_raw)
+    x_log = np.log10(np.abs(x_raw) + 1e-12)
+    y_log = np.log10(np.maximum(y_interleaved, 1e-12))
 
-    # ==========================================
-    # 修复 4: 标签 (Y) 交织处理与偏移对齐
-    # ==========================================
-    # 1) Y_raw 是 [res1..res5, thick1..thick4]
-    # 我们需要将其交织(interleave)为 Seq2Seq 需要的 [res1, thick1, res2, thick2..., res5]
-    Y_interleaved = np.zeros_like(Y_raw)
-    for i in range(LAYER_NUM - 1):
-        Y_interleaved[:, i * 2] = Y_raw[:, i]  # 填入电阻率
-        Y_interleaved[:, i * 2 + 1] = Y_raw[:, LAYER_NUM + i]  # 填入厚度
-    Y_interleaved[:, -1] = Y_raw[:, LAYER_NUM - 1]  # 填入最后一个半空间电阻率
+    x_max, x_min = np.max(x_log, axis=0), np.min(x_log, axis=0)
+    y_max, y_min = np.max(y_log, axis=0), np.min(y_log, axis=0)
+    x_scaled = (x_log - x_min) / (x_max - x_min + 1e-8)
+    y_scaled = (y_log - y_min) / (y_max - y_min + 1e-8) + 10.0
 
-    # 2) 对 X 和 Y 均进行对数变换 (物理数据跨度大必须对数化)
-    X_log = np.log10(np.abs(X_raw) + 1e-12)
-    Y_log = np.log10(Y_interleaved)
-
-    # 3) MinMax 归一化提取参数
-    x_max, x_min = np.max(X_log, axis=0), np.min(X_log, axis=0)
-    y_max, y_min = np.max(Y_log, axis=0), np.min(Y_log, axis=0)
-
-    X_scaled = (X_log - x_min) / (x_max - x_min + 1e-8)
-    Y_scaled = (Y_log - y_min) / (y_max - y_min + 1e-8)
-
-    # 4) 极度关键：给 Y 加上 10.0，与 net.py 中的 relu(x + 10.0) 激活层在数值空间对齐
-    Y_scaled = Y_scaled + 10.0
-
-    # 保存归一化字典供后续测试预测使用
-    scaler_dict = {
-        "x_max": x_max.tolist(), "x_min": x_min.tolist(),
-        "y_max": y_max.tolist(), "y_min": y_min.tolist()
+    scaler = {
+        "x_max": x_max.tolist(),
+        "x_min": x_min.tolist(),
+        "y_max": y_max.tolist(),
+        "y_min": y_min.tolist(),
+        "space": "log10",
+        "layer_num": LAYER_NUM,
+        "time_channels": int(x_raw.shape[1]),
+        "time_min": float(target_times[0]),
+        "time_max": float(target_times[-1]),
+        "target_times": target_times.astype(float).tolist(),
     }
-    with open(SCALER_SAVE_PATH, "w") as f:
-        json.dump(scaler_dict, f)
-    print(f"✅ 归一化参数已保存至: {SCALER_SAVE_PATH}")
+    with open(SCALER_SAVE_PATH, "w", encoding="utf-8") as f:
+        json.dump(scaler, f, indent=2)
 
-    # 2. 构造 Dataloader
-    tensor_x = torch.Tensor(X_scaled).to(DEVICE)
-    tensor_y = torch.Tensor(Y_scaled).to(DEVICE)
+    tensor_x = torch.tensor(x_scaled, dtype=torch.float32).to(DEVICE)
+    tensor_y = torch.tensor(y_scaled, dtype=torch.float32).to(DEVICE)
     dataset = TensorDataset(tensor_x, tensor_y)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
-    # 3. 初始化模型 (修复 6：传入 layer_num 精确控制解码步长)
+    valid_len = max(1, int(len(dataset) * VALID_PORTION))
+    train_len = len(dataset) - valid_len
+    if train_len < 1:
+        train_len, valid_len = len(dataset), 0
+
+    generator = torch.Generator().manual_seed(RANDOM_SEED)
+    if valid_len:
+        train_set, valid_set = random_split(dataset, [train_len, valid_len], generator=generator)
+    else:
+        train_set, valid_set = dataset, None
+
+    train_loader = DataLoader(train_set, batch_size=min(BATCH_SIZE, train_len), shuffle=True, drop_last=False)
+    valid_loader = DataLoader(valid_set, batch_size=min(BATCH_SIZE, max(1, valid_len)), shuffle=False) if valid_set else None
+
     model = TEM_Seq2Seq_Net(layer_num=LAYER_NUM).to(DEVICE)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = TEMRelativeLoss()
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_lr)
+    criterion = TEMRelativeLoss()
+    best_loss = float("inf")
+    history = []
 
-    print(f"🚀 开始训练网络... 总 Epochs={EPOCHS}, Device={DEVICE}")
-    best_loss = float('inf')
-
-    # 4. 训练循环
     for epoch in range(EPOCHS):
         model.train()
-        total_loss = 0
-
-        for batch_x, batch_y in loader:
+        train_total = 0.0
+        for batch_x, batch_y in train_loader:
             optimizer.zero_grad()
-
-            # 前向传播
-            outputs = model(batch_x)
-
-            # 计算定制的相对百分比误差
-            loss = criterion(outputs, batch_y)
+            loss = criterion(model(batch_x), batch_y)
             loss.backward()
-
-            # 梯度裁剪防爆 (Seq2Seq / LSTM 常用技巧)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             optimizer.step()
-            total_loss += loss.item()
+            train_total += float(loss.item())
 
-        # 调度器在每个 Epoch 结束步进
+        train_loss = train_total / max(len(train_loader), 1)
+        valid_loss = None
+        if valid_loader is not None:
+            model.eval()
+            valid_total = 0.0
+            with torch.no_grad():
+                for batch_x, batch_y in valid_loader:
+                    valid_total += float(criterion(model(batch_x), batch_y).item())
+            valid_loss = valid_total / max(len(valid_loader), 1)
+
         scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
+        monitor = valid_loss if valid_loss is not None else train_loss
+        history.append({"epoch": epoch + 1, "train_loss": train_loss, "valid_loss": valid_loss})
 
-        avg_loss = total_loss / len(loader)
+        if monitor < best_loss:
+            best_loss = monitor
+            torch.save({
+                "model_state": model.state_dict(),
+                "metadata": {
+                    "layer_num": LAYER_NUM,
+                    "time_channels": int(x_raw.shape[1]),
+                    "time_min": float(target_times[0]),
+                    "time_max": float(target_times[-1]),
+                    "best_loss": float(best_loss),
+                    "target_space": "log10",
+                },
+            }, MODEL_SAVE_PATH)
 
-        # 仅定期打印日志，减少刷屏
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch [{epoch + 1:03d}/{EPOCHS}], LR: {current_lr:.5f}, Loss(MAPE): {avg_loss:.5f}")
+        if epoch == 0 or (epoch + 1) % 5 == 0:
+            valid_text = f", valid={valid_loss:.5f}" if valid_loss is not None else ""
+            print(f"epoch {epoch + 1:03d}/{EPOCHS}: train={train_loss:.5f}{valid_text}")
 
-        # 保存最优模型
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-
-    print(f"🎉 训练完美结束，最优模型(Loss={best_loss:.5f})已保存至 {MODEL_SAVE_PATH}")
+    with open(TRAIN_HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    print(f"Training complete. best_loss={best_loss:.5f}, model={MODEL_SAVE_PATH}")
 
 
 if __name__ == "__main__":
