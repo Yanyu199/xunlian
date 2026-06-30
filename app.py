@@ -1,4 +1,6 @@
 import os
+import tempfile
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -69,6 +71,52 @@ async def predict_file(file: UploadFile = File(...)):
         return predict_dataset(dataset)
     except ModuleNotFoundError as exc:
         raise HTTPException(status_code=500, detail=f"缺少后端模型依赖: {exc.name}") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/model/validate")
+async def validate_model_file(
+    model_file: UploadFile = File(...),
+    data_file: UploadFile = File(...),
+    scaler_file: Optional[UploadFile] = File(None),
+):
+    try:
+        from core.model_validator import validate_model_with_dataset
+
+        dataset = parse_real_tem_bytes(await data_file.read())
+        suffix = os.path.splitext(model_file.filename or "")[1] or ".pt"
+        with tempfile.TemporaryDirectory(prefix="tem_validate_", dir=OUTPUT_DIR) as tmp_dir:
+            model_path = os.path.join(tmp_dir, f"uploaded_model{suffix}")
+            with open(model_path, "wb") as f:
+                f.write(await model_file.read())
+
+            scaler_path = SCALER_SAVE_PATH
+            used_uploaded_scaler = False
+            if scaler_file is not None:
+                scaler_suffix = os.path.splitext(scaler_file.filename or "")[1] or ".json"
+                scaler_path = os.path.join(tmp_dir, f"uploaded_scaler{scaler_suffix}")
+                with open(scaler_path, "wb") as f:
+                    f.write(await scaler_file.read())
+                used_uploaded_scaler = True
+
+            result = validate_model_with_dataset(dataset, model_path=model_path, scaler_path=scaler_path)
+            result["uploaded"] = {
+                "model_filename": model_file.filename,
+                "data_filename": data_file.filename,
+                "scaler_filename": scaler_file.filename if scaler_file else None,
+                "used_uploaded_scaler": used_uploaded_scaler,
+            }
+            if not used_uploaded_scaler:
+                result.setdefault("warnings", []).insert(
+                    0,
+                    "未上传对应 scaler，当前验证使用系统激活的归一化文件；若它不是同一次训练生成，验证结果只能作为参考。",
+                )
+            return result
+    except ModuleNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"缂哄皯鍚庣妯″瀷渚濊禆: {exc.name}") from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

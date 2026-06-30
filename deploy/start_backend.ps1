@@ -3,7 +3,7 @@ param(
   [string]$PythonExe = "H:\codexdata\envs\tem\python.exe",
   [string]$CodexDataDir = "H:\codexdata",
   [string]$HostAddress = "0.0.0.0",
-  [int]$Port = 8000
+  [int]$Port = 8001
 )
 
 $ErrorActionPreference = "Stop"

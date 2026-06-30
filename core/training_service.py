@@ -16,10 +16,8 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 from config import (
     CODEXDATA_DIR,
     MODEL_SAVE_PATH,
+    OUTPUT_DIR,
     RANDOM_SEED,
-    ROOT_HISTORY_SAVE_TEMPLATE,
-    ROOT_MODEL_SAVE_TEMPLATE,
-    ROOT_SCALER_SAVE_TEMPLATE,
     SCALER_SAVE_PATH,
     TRAIN_HISTORY_PATH,
     TRAINING_JOBS_DIR,
@@ -392,7 +390,39 @@ def _resolve_device(job: TrainingJob) -> torch.device:
     return device
 
 
-def _train_model(job: TrainingJob, x_raw: np.ndarray, y_raw: np.ndarray, target_times: np.ndarray):
+def _align_simulated_inputs_to_real(x_raw: np.ndarray, real_resampled: np.ndarray):
+    job.update("璁粌鍑嗗", 4, 45, 57, "Key step: align simulated response to real Z log-amplitude domain, then fit MinMax scaler.", key=True)
+    x_log, x_min, x_max, input_alignment = _align_simulated_inputs_to_real(x_raw, real_resampled)
+    real_log = np.log10(np.abs(real_resampled) + 1e-12)
+
+    sim_mean = np.mean(x_log, axis=0)
+    sim_std = np.std(x_log, axis=0) + 1e-8
+    real_mean = np.mean(real_log, axis=0)
+    real_std_raw = np.std(real_log, axis=0)
+    real_std = np.maximum(real_std_raw, 0.25 * sim_std) + 1e-8
+
+    x_aligned = (x_log - sim_mean) / sim_std * real_std + real_mean
+    combined = np.vstack((x_aligned, real_log))
+    x_min = np.min(combined, axis=0)
+    x_max = np.max(combined, axis=0)
+
+    diagnostics = {
+        "method": "per_time_log_standardize_simulated_to_real",
+        "scaler_fit_source": "aligned_simulated_plus_real",
+        "sim_log_mean": sim_mean.tolist(),
+        "sim_log_std": sim_std.tolist(),
+        "real_log_mean": real_mean.tolist(),
+        "real_log_std": real_std.tolist(),
+        "real_log_std_raw": real_std_raw.tolist(),
+        "aligned_sim_log_min": np.min(x_aligned, axis=0).tolist(),
+        "aligned_sim_log_max": np.max(x_aligned, axis=0).tolist(),
+        "real_log_min": np.min(real_log, axis=0).tolist(),
+        "real_log_max": np.max(real_log, axis=0).tolist(),
+    }
+    return x_aligned, x_min, x_max, diagnostics
+
+
+def _train_model(job: TrainingJob, x_raw: np.ndarray, y_raw: np.ndarray, target_times: np.ndarray, real_resampled: np.ndarray):
     p = job.params
     if p.torch_threads and p.torch_threads > 0:
         torch.set_num_threads(p.torch_threads)
@@ -404,7 +434,6 @@ def _train_model(job: TrainingJob, x_raw: np.ndarray, y_raw: np.ndarray, target_
     y_log = np.log10(np.maximum(y_interleaved, 1e-12))
 
     job.update("训练准备", 4, 45, 57, "关键环节：对输入响应和目标参数执行 log10 + MinMax 归一化。", key=True)
-    x_max, x_min = np.max(x_log, axis=0), np.min(x_log, axis=0)
     y_max, y_min = np.max(y_log, axis=0), np.min(y_log, axis=0)
     x_scaled = (x_log - x_min) / (x_max - x_min + 1e-8)
     y_scaled = (y_log - y_min) / (y_max - y_min + 1e-8) + 10.0
@@ -489,6 +518,7 @@ def _train_model(job: TrainingJob, x_raw: np.ndarray, y_raw: np.ndarray, target_
         "time_min": float(target_times[0]),
         "time_max": float(target_times[-1]),
         "target_times": target_times.astype(float).tolist(),
+        "input_alignment": input_alignment,
     }
     return best_state, best_loss, scaler, history, str(device)
 
@@ -524,14 +554,18 @@ def _run_training_job(job: TrainingJob, content: bytes, job_dir: str):
         np.save(os.path.join(job_dir, "time_gates.npy"), target_times)
         job.update("正演样本", 3, 100, 55, f"关键环节：样本落盘完成，X{x_data.shape}, Y{y_data.shape}。", key=True)
 
-        best_state, best_loss, scaler, history, used_device = _train_model(job, x_data, y_data, target_times)
+        best_state, best_loss, scaler, history, used_device = _train_model(job, x_data, y_data, target_times, real_resampled)
         if best_state is None:
             raise RuntimeError("训练未产生有效模型。")
 
         job.update("保存结果", 6, 20, 96, "关键环节：正在保存任务模型，并同步为当前激活模型。", key=True)
-        model_path = ROOT_MODEL_SAVE_TEMPLATE.format(job_id=job.job_id)
-        scaler_path = ROOT_SCALER_SAVE_TEMPLATE.format(job_id=job.job_id)
-        history_path = ROOT_HISTORY_SAVE_TEMPLATE.format(job_id=job.job_id)
+        result_dir = os.path.join(OUTPUT_DIR, job.job_id)
+        os.makedirs(result_dir, exist_ok=True)
+        model_path = os.path.join(result_dir, "best_tem_model.pt")
+        scaler_path = os.path.join(result_dir, "data_scaler.json")
+        history_path = os.path.join(result_dir, "train_history.json")
+        uploaded_data_path = os.path.join(result_dir, job.filename)
+        summary_path = os.path.join(result_dir, "training_summary.json")
         checkpoint = {
             "model_state": best_state,
             "metadata": {
@@ -555,6 +589,29 @@ def _run_training_job(job: TrainingJob, content: bytes, job_dir: str):
         for path in (history_path, TRAIN_HISTORY_PATH):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
+        with open(uploaded_data_path, "wb") as f:
+            f.write(content)
+
+        summary = {
+            "job_id": job.job_id,
+            "filename": job.filename,
+            "model_path": model_path,
+            "scaler_path": scaler_path,
+            "history_path": history_path,
+            "uploaded_data_path": uploaded_data_path,
+            "active_model_path": MODEL_SAVE_PATH,
+            "active_scaler_path": SCALER_SAVE_PATH,
+            "active_history_path": TRAIN_HISTORY_PATH,
+            "best_loss": float(best_loss),
+            "used_device": used_device,
+            "params": asdict(p),
+            "qc": qc,
+            "resistivity_range": [r_min, r_max],
+            "input_alignment": scaler.get("input_alignment"),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
 
         with job.lock:
             job.status = "completed"
@@ -566,9 +623,12 @@ def _run_training_job(job: TrainingJob, content: bytes, job_dir: str):
             job.finished_at = time.time()
             job.last_update = time.time()
             job.result = {
+                "result_dir": result_dir,
                 "model_path": model_path,
                 "scaler_path": scaler_path,
                 "history_path": history_path,
+                "summary_path": summary_path,
+                "uploaded_data_path": uploaded_data_path,
                 "active_model_path": MODEL_SAVE_PATH,
                 "active_scaler_path": SCALER_SAVE_PATH,
                 "active_history_path": TRAIN_HISTORY_PATH,

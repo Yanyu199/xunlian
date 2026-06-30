@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8001'
 
 async function request(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, options)
@@ -38,4 +38,12 @@ export function predictFile(file) {
   const form = new FormData()
   form.append('file', file)
   return request('/api/inversion/predict', { method: 'POST', body: form })
+}
+
+export function validateModel(modelFile, dataFile, scalerFile = null) {
+  const form = new FormData()
+  form.append('model_file', modelFile)
+  form.append('data_file', dataFile)
+  if (scalerFile) form.append('scaler_file', scalerFile)
+  return request('/api/model/validate', { method: 'POST', body: form })
 }

@@ -12,5 +12,5 @@ if (!(Test-Path "node_modules")) {
 }
 
 Write-Host "Starting TEM frontend..."
-Write-Host "URL: http://127.0.0.1:5173"
+Write-Host "URL: http://127.0.0.1:5174"
 npm run dev

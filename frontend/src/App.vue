@@ -1,17 +1,21 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { getHealth, getTrainingDefaults, getTrainingStatus, predictFile, startTraining, uploadForQc } from './api'
+import { getHealth, getTrainingDefaults, getTrainingStatus, predictFile, startTraining, uploadForQc, validateModel } from './api'
 
 const health = ref(null)
 const selectedFile = ref(null)
+const validationModelFile = ref(null)
+const validationScalerFile = ref(null)
 const qc = ref(null)
 const params = ref({})
 const gpu = ref(null)
 const job = ref(null)
 const prediction = ref(null)
+const modelValidation = ref(null)
 const error = ref('')
 const busy = ref(false)
 const predicting = ref(false)
+const validating = ref(false)
 const activeTip = ref(null)
 let timer = null
 
@@ -194,6 +198,15 @@ const canPredict = computed(() => (
   !predicting.value &&
   !['queued', 'running'].includes(job.value?.status)
 ))
+const canValidate = computed(() => (
+  selectedFile.value &&
+  validationModelFile.value &&
+  (validationScalerFile.value || health.value?.scaler_exists) &&
+  !busy.value &&
+  !predicting.value &&
+  !validating.value &&
+  !['queued', 'running'].includes(job.value?.status)
+))
 
 const trainStatusText = computed(() => {
   const status = job.value?.status
@@ -216,6 +229,7 @@ const stageBars = computed(() => {
 
 const logRows = computed(() => job.value?.logs || [])
 const predictionRows = computed(() => prediction.value?.results || [])
+const validationChecks = computed(() => modelValidation.value?.checks || [])
 
 function formatNumber(value, digits = 3) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '-'
@@ -285,8 +299,21 @@ function onFileChange(event) {
   qc.value = null
   job.value = null
   prediction.value = null
+  modelValidation.value = null
   error.value = ''
   if (selectedFile.value) runQc(true)
+}
+
+function onValidationModelChange(event) {
+  validationModelFile.value = event.target.files?.[0] || null
+  modelValidation.value = null
+  error.value = ''
+}
+
+function onValidationScalerChange(event) {
+  validationScalerFile.value = event.target.files?.[0] || null
+  modelValidation.value = null
+  error.value = ''
 }
 
 async function refreshHealth() {
@@ -377,6 +404,20 @@ async function runPrediction() {
   }
 }
 
+async function runModelValidation() {
+  if (!selectedFile.value || !validationModelFile.value) return
+  validating.value = true
+  error.value = ''
+  modelValidation.value = null
+  try {
+    modelValidation.value = await validateModel(validationModelFile.value, selectedFile.value, validationScalerFile.value)
+  } catch (err) {
+    error.value = err.message
+  } finally {
+    validating.value = false
+  }
+}
+
 onMounted(async () => {
   await Promise.all([refreshHealth(), loadDefaults()])
 })
@@ -424,10 +465,23 @@ onUnmounted(stopPolling)
           <div class="file-name">{{ selectedFile?.name || '未选择文件' }}</div>
         </div>
 
+        <div class="file-box validation-upload">
+          <label for="model-file">验证模型 .pt 文件</label>
+          <input id="model-file" type="file" accept=".pt,.pth" @change="onValidationModelChange" />
+          <div class="file-name">{{ validationModelFile?.name || '未选择模型文件' }}</div>
+        </div>
+
+        <div class="file-box validation-upload">
+          <label for="scaler-file">对应 scaler .json（可选）</label>
+          <input id="scaler-file" type="file" accept=".json" @change="onValidationScalerChange" />
+          <div class="file-name">{{ validationScalerFile?.name || '未选择时使用当前激活 scaler' }}</div>
+        </div>
+
         <div class="actions">
           <button :disabled="!selectedFile || busy" @click="runQc(true)">质控/自动识别</button>
           <button class="primary" :disabled="!canTrain || busy" @click="runTraining">训练</button>
           <button :disabled="!canPredict" @click="runPrediction">反演预测</button>
+          <button :disabled="!canValidate" @click="runModelValidation">模型验证</button>
         </div>
 
         <div v-if="error" class="alert">{{ error }}</div>
@@ -574,6 +628,29 @@ onUnmounted(stopPolling)
               </tr>
             </tbody>
           </table>
+        </div>
+
+        <div v-if="validating" class="empty">正在验证模型</div>
+        <div v-if="modelValidation" class="panel-head result-head">
+          <h2>模型验证结果</h2>
+          <span :class="['pill', modelValidation.status]">
+            {{ modelValidation.status }} · {{ formatNumber(modelValidation.score, 1) }} 分
+          </span>
+        </div>
+        <div v-if="modelValidation" class="metrics">
+          <div><span>输入超界比例</span><strong>{{ formatNumber((modelValidation.summary?.input_outside_ratio || 0) * 100, 1) }}%</strong></div>
+          <div><span>输出最小值</span><strong>{{ formatNumber(modelValidation.summary?.prediction_stats?.min, 3) }}</strong></div>
+          <div><span>输出最大值</span><strong>{{ formatNumber(modelValidation.summary?.prediction_stats?.max, 3) }}</strong></div>
+          <div><span>模型时间道</span><strong>{{ modelValidation.model?.time_channels }}</strong></div>
+        </div>
+        <div v-if="modelValidation?.warnings?.length" class="alert soft">
+          <p v-for="warning in modelValidation.warnings" :key="warning">{{ warning }}</p>
+        </div>
+        <div v-if="validationChecks.length" class="validation-list">
+          <div v-for="check in validationChecks" :key="check.name" :class="['validation-item', check.status]">
+            <strong>{{ check.name }}</strong>
+            <span>{{ check.message }}</span>
+          </div>
         </div>
 
         <div v-if="logRows.length" class="log-box">
